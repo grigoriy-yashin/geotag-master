@@ -221,8 +221,9 @@ ext_args=(); for e in "${EXTS[@]}"; do ext_args+=(-ext "$e"); done
 # -------------------- Summary --------------------
 echo "Photos root   : $PHOTOS_ROOT"
 echo "GPX pool      : $GPX_POOL"
-echo "Camera TZ     : $FROM_TZ (offset $(secs_to_hms $FROM_OFFS))"
-echo "Actual TZ     : $TO_TZ   (offset $(secs_to_hms $TO_OFFS))"
+fmt_offs(){ local s; s=$(secs_to_hms "$1"); echo "${s%% *}"; }  # drop spaces if any
+echo "Camera TZ     : $FROM_TZ (offset $(fmt_offs $FROM_OFFS))"
+echo "Actual TZ     : $TO_TZ   (offset $(fmt_offs $TO_OFFS))"
 if [[ -n "$DRIFT_KIND" ]]; then
   echo "Camera drift  : $DRIFT_KIND $DRIFT_VAL  => $(secs_to_hms $DRIFT_SECS)"
 else

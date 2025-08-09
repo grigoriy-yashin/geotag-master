@@ -240,14 +240,22 @@ echo
 # -------------------- Optionally rewrite EXIF times --------------------
 if [[ $WRITE_TIME -eq 1 ]]; then
   if [[ $NET_DELTA -ne 0 ]]; then
-    shift_hms=$(secs_to_hms $NET_DELTA)
-    # Shift typical capture fields; include ModifyDate to keep tools in sync
-    run "-DateTimeOriginal+=${shift_hms#}" "-CreateDate+=${shift_hms#}" "-ModifyDate+=${shift_hms#}" \
-        -r "${ext_args[@]}" "$PHOTOS_ROOT" >/dev/null
+    abs_sec=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
+    abs_hms=$(secs_to_hms $abs_sec)         # prints like +0:3:0; strip the sign:
+    abs_hms="${abs_hms#?}"
+
+    if [[ $NET_DELTA -gt 0 ]]; then
+      # add time
+      run "-DateTimeOriginal+=${abs_hms}" "-CreateDate+=${abs_hms}" "-ModifyDate+=${abs_hms}" \
+          -r "${ext_args[@]}" "$PHOTOS_ROOT" >/dev/null
+    else
+      # subtract time
+      run "-DateTimeOriginal-=${abs_hms}" "-CreateDate-=${abs_hms}" "-ModifyDate-=${abs_hms}" \
+          -r "${ext_args[@]}" "$PHOTOS_ROOT" >/dev/null
+    fi
   fi
 
   if [[ $WRITE_TZ_TAGS -eq 1 ]]; then
-    # Write EXIF offset tags to match TO_TZ
     to_abs=$TO_OFFS; to_sign="+"; [[ $to_abs -lt 0 ]] && to_sign="-" && to_abs=$(( -to_abs ))
     to_h=$(printf "%02d" $(( to_abs/3600 ))); to_m=$(printf "%02d" $(( (to_abs%3600)/60 )))
     tzstr="${to_sign}${to_h}:${to_m}"
@@ -255,6 +263,7 @@ if [[ $WRITE_TIME -eq 1 ]]; then
         -r "${ext_args[@]}" "$PHOTOS_ROOT" >/dev/null
   fi
 fi
+
 
 # -------------------- Geotagging --------------------
 # Build geotag args

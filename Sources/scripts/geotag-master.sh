@@ -278,10 +278,11 @@ while IFS= read -r -d '' dir; do
   shopt -u nullglob
   [[ ${#gpx_here[@]} -eq 0 ]] && continue
 
+  # NON-RECURSIVE: no -r; target only this folder
   if [[ "$RETAG_MODE" == "missing" ]]; then
-    run "${geo_args[@]}" -geotag "$dir" "${ext_args[@]}" -if "not \$gpslatitude" -r:="-" "$dir" >/dev/null
+    run "${geo_args[@]}" -geotag "$dir" "${ext_args[@]}" -if 'not $gpslatitude' "$dir" >/dev/null
   else
-    run "${geo_args[@]}" -geotag "$dir" "${ext_args[@]}" -r:="-" "$dir" >/dev/null
+    run "${geo_args[@]}" -geotag "$dir" "${ext_args[@]}" "$dir" >/dev/null
   fi
 done < <(find "$PHOTOS_ROOT" -type d -print0)
 
@@ -301,7 +302,8 @@ if [[ ${#pool_gpx[@]} -gt 0 ]]; then
     [[ "$missing_count" -eq 0 ]] && continue
 
     for gpx in "${pool_gpx[@]}"; do
-      out=$(run "${geo_args[@]}" -geotag "$gpx" "${ext_args[@]}" -if "not \$gpslatitude" -r:="-" "$dir" 2>&1 || true)
+      # Also NON-RECURSIVE: only the current folder
+      out=$(run "${geo_args[@]}" -geotag "$gpx" "${ext_args[@]}" -if 'not $gpslatitude' "$dir" 2>&1 || true)
       # sum "... image files updated/created"
       updated=$(grep -Eo '[0-9]+ image files (updated|created)' <<<"$out" | awk '{s+=$1} END{print s+0}')
       [[ $DRYRUN -eq 1 ]] && updated=1

@@ -119,6 +119,10 @@ done
 # Supported numeric: Z, UTC, UTC+5, UTC-3:30, +06, -04:00
 parse_tz_to_seconds() {
   local z="$1"
+  # trim spaces
+  z="${z#"${z%%[![:space:]]*}"}"
+  z="${z%"${z##*[![:space:]]}"}"
+
   if [[ "$z" == "Z" || "$z" == "UTC" || "$z" == "utc" ]]; then
     echo 0; return
   fi
@@ -135,7 +139,7 @@ parse_tz_to_seconds() {
     [[ "$sign" == "-" ]] && secs=$((-secs))
     echo "$secs"; return
   fi
-  # IANA zone; take current offset (deterministic at run time)
+  # IANA fallback
   TZ="$z" date +%z >/dev/null 2>&1 || die "Unknown time zone: $z"
   local s; s="$(TZ="$z" date +%z)"  # e.g. +0600
   local sign="${s:0:1}" hh="${s:1:2}" mm="${s:3:2}"

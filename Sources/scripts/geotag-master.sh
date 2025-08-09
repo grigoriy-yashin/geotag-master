@@ -8,7 +8,7 @@ set -euo pipefail
 #   # Camera showed Moscow (UTC+3), actual Astana (UTC+6), camera 2 minutes fast:
 #   ./geotag-smart.sh --photos /data/photos --pool /data/gpx \
 #     --from-tz UTC+3 --to-tz UTC+6 --drift-ahead 2m \
-#     --write-time --write-tz-tags --copy-matched
+#     --write-time --write-tz-tags --copy-matched-tracks
 #
 #   # Same using IANA zones instead of fixed offsets:
 #   ./geotag-smart.sh --photos /data/photos --pool /data/gpx \
@@ -64,7 +64,7 @@ iNaturalist-friendly normalization:
   --write-tz-tags        # write OffsetTimeOriginal/OffsetTime/OffsetTimeDigitized for iNat (+06:00 etc.)
 
 Behavior:
-  --copy-matched         # copy a pool GPX into the folder it successfully tags
+  --copy-matched-tracks  # copy a pool GPX into the folder it successfully tags
   --retag overwrite      # allow overwriting existing GPS (default: only fill missing GPS)
   --overwrite            # do not keep _original backups
   --dry-run              # print actions only
@@ -74,7 +74,7 @@ Examples:
   # Moscow -> Astana, camera 2 min fast, iNat-ready:
   ./geotag-smart.sh --photos /data/photos --pool /data/gpx \
     --from-tz UTC+3 --to-tz UTC+6 --drift-ahead 2m \
-    --write-time --write-tz-tags --copy-matched
+    --write-time --write-tz-tags --copy-matched-tracks
 
 Notes:
   • If you omit --write-time/--write-tz-tags, EXIF capture times remain as-shot (only GPS is added).
@@ -98,7 +98,7 @@ while [[ $# -gt 0 ]]; do
     --write-tz-tags) WRITE_TZ_TAGS=1; shift;;
 
     --overwrite) OVERWRITE=1; shift;;
-    --copy-matched) COPY_MATCHED=1; shift;;
+    --copy-matched-tracks) COPY_MATCHED=1; shift;;
     --retag)
       [[ "${2:-}" =~ ^(missing|overwrite)$ ]] || die "--retag must be 'missing' or 'overwrite'"
       RETAG_MODE="$2"; shift 2;;

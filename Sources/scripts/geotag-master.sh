@@ -92,9 +92,9 @@ abs_hms(){ local s=$1; [[ $s -lt 0 ]] && s=$((-s)); printf "%d:%d:%d" $((s/3600)
 
 drift_to_seconds(){
   local v="$1"
-  if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASHREMATCH[1]}*60 + ${BASHREMATCH[2]} ))
-  elif [[ "$v" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASHREMATCH[1]}*60 ))
-  elif [[ "$v" =~ ^([+-]?)([0-9]+)s$ ]]; then echo $(( ${BASHREMATCH[2]} ))
+  if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 + ${BASH_REMATCH[2]} ))
+  elif [[ "$v" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 ))
+  elif [[ "$v" =~ ^([+-]?)([0-9]+)s$ ]]; then echo $(( ${BASH_REMATCH[2]} ))
   elif [[ "$v" =~ ^([0-9]+)$ ]]; then echo "$v"
   else die "Bad drift '$v' (use 3m, 45s, 1:30m, +75s)"; fi
 }

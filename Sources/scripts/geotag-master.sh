@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# geotag-min.sh — do it the simple, robust way (per-folder, quoted args)
+# geotag-min.sh — simple & robust, per-folder, quoted exiftool args
 
 PHOTOS_ROOT="."
 GPX_POOL=""
@@ -16,7 +16,7 @@ RETAG_MODE="missing"  # missing|overwrite
 COPY_MATCHED=0
 OVERWRITE=0
 VERBOSE=0
-ALSO_QT=0   # optional: shift QuickTime/XMP too
+ALSO_QT=0
 
 die(){ echo "Error: $*" >&2; exit 1; }
 
@@ -24,7 +24,6 @@ usage(){
 cat <<'H'
 Usage:
   geotag-min.sh --photos DIR --pool DIR --from-tz ZONE --to-tz ZONE [options]
-
 Zones:  Europe/Moscow  Asia/Almaty  UTC+6  +05:00  -3:30  Z  UTC
 Drift:  --drift-ahead 2m | --drift-behind 30s | --drift-exact +75s
 Flags:  --write-time --write-tz-tags [--also-qt] --retag overwrite --copy-matched --overwrite --verbose
@@ -60,6 +59,7 @@ done
 
 # ---------- helpers ----------
 trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
+
 parse_tz_to_seconds(){
   local z; z="$(trim "$1")"
   if [[ "$z" == "Z" || "$z" == "UTC" || "$z" == "utc" ]]; then echo 0; return; fi
@@ -76,6 +76,7 @@ parse_tz_to_seconds(){
   local s; s="$(TZ="$z" date +%z)"; local sgn="${s:0:1}" hh="${s:1:2}" mm="${s:3:2}"
   local secs=$((10#$hh*3600 + 10#$mm*60)); [[ $sgn == "-" ]] && secs=$((-secs)); echo "$secs"
 }
+
 pad_hms(){ local s=$1; local sign="+"; [[ $s -lt 0 ]] && sign="-" && s=$((-s)); printf "%s%02d:%02d:%02d" "$sign" $((s/3600)) $(((s%3600)/60)) $((s%60)); }
 
 parse_drift_abs(){
@@ -118,25 +119,21 @@ echo "Overwrite     : $([[ $OVERWRITE -eq 1 ]] && echo YES || echo NO)"
 echo "Verbose       : $([[ $VERBOSE -eq 1 ]] && echo YES || echo NO)"
 echo
 
-# ---------- run helpers ----------
+# ---------- run helper ----------
 xt_common=(-P); [[ $OVERWRITE -eq 1 ]] && xt_common+=(-overwrite_original)
-xt(){  # print then run
-  if [[ $VERBOSE -eq 1 ]]; then printf "[CMD] exiftool"; for a in "${xt_common[@]}"; do printf " %q" "$a"; done; while [[ $# -gt 0 ]]; do printf " %q" "$1"; shift; done; echo; fi
-  exiftool "${xt_common[@]}" "$@"
-}
+xt(){ if [[ $VERBOSE -eq 1 ]]; then printf "[CMD] exiftool"; for a in "${xt_common[@]}"; do printf " %q" "$a"; done; while [[ $# -gt 0 ]]; do printf " %q" "$1"; shift; done; echo; fi; exiftool "${xt_common[@]}" "$@"; }
 
-# ---------- Phase A: per-folder time & tz tags (using globs; QUOTED args) ----------
+# ---------- Phase A ----------
 if [[ $WRITE_TIME -eq 1 || $WRITE_TZ_TAGS -eq 1 ]]; then
   echo "Phase A: time / tz tags..."
   while IFS= read -r -d '' dir; do
     shopt -s nullglob
-    files=( "$dir"/*.JPG "$dir"/*.jpg "$dir"/*.JPEG "$dir"/*.jpeg "$dir"/*.ORF" " $dir"/*.orf "$dir"/*.RW2 "$dir"/*.rw2 "$dir"/*.ARW "$dir"/*.arw "$dir"/*.CR2 "$dir"/*.cr2 "$dir"/*.DNG "$dir"/*.dng "$dir"/*.NEF "$dir"/*.nef "$dir"/*.HEIC "$dir"/*.heic "$dir"/*.HEIF "$dir"/*.heif "$dir"/*.TIF "$dir"/*.tif "$dir"/*.TIFF "$dir"/*.tiff )
+    files=( "$dir"/*.JPG "$dir"/*.jpg "$dir"/*.JPEG "$dir"/*.jpeg "$dir"/*.ORF "$dir"/*.orf "$dir"/*.RW2 "$dir"/*.rw2 "$dir"/*.ARW "$dir"/*.arw "$dir"/*.CR2 "$dir"/*.cr2 "$dir"/*.DNG "$dir"/*.dng "$dir"/*.NEF "$dir"/*.nef "$dir"/*.HEIC "$dir"/*.heic "$dir"/*.HEIF "$dir"/*.heif "$dir"/*.TIF "$dir"/*.tif "$dir"/*.TIFF "$dir"/*.tiff )
     shopt -u nullglob
     (( ${#files[@]} == 0 )) && continue
 
     if [[ $WRITE_TIME -eq 1 && $NET_DELTA -ne 0 ]]; then
-      abs=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
-      shift_str="$(pad_hms $abs)"; shift_str="${shift_str#?}"  # HH:MM:SS
+      abs=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA )); shift_str="$(pad_hms $abs)"; shift_str="${shift_str#?}"
       if [[ $NET_DELTA -gt 0 ]]; then
         xt "-DateTimeOriginal+=${shift_str}" "-CreateDate+=${shift_str}" "-ModifyDate+=${shift_str}" "${files[@]}"
         [[ $ALSO_QT -eq 1 ]] && xt "-QuickTime:CreateDate+=${shift_str}" "-QuickTime:ModifyDate+=${shift_str}" "-QuickTime:MediaCreateDate+=${shift_str}" "-XMP:CreateDate+=${shift_str}" "${files[@]}"
@@ -154,17 +151,18 @@ if [[ $WRITE_TIME -eq 1 || $WRITE_TZ_TAGS -eq 1 ]]; then
   done < <(find "$PHOTOS_ROOT" -type d -print0)
 fi
 
-# ---------- Phase B: geotagging (local first, then pool), QUOTED -geosync ----------
+# ---------- Phase B ----------
 echo "Phase B: geotagging..."
 geo_shift="$(pad_hms $GEO_SHIFT)"
 while IFS= read -r -d '' dir; do
   shopt -s nullglob
   files=( "$dir"/*.JPG "$dir"/*.jpg "$dir"/*.JPEG "$dir"/*.jpeg "$dir"/*.ORF "$dir"/*.orf "$dir"/*.RW2 "$dir"/*.rw2 "$dir"/*.ARW "$dir"/*.arw "$dir"/*.CR2 "$dir"/*.cr2 "$dir"/*.DNG "$dir"/*.dng "$dir"/*.NEF "$dir"/*.nef "$dir"/*.HEIC "$dir"/*.heic "$dir"/*.HEIF "$dir"/*.heif "$dir"/*.TIF "$dir"/*.tif "$dir"/*.TIFF "$dir"/*.tiff )
   loc=( "$dir"/*.gpx "$dir"/*.GPX )
+  pool=( "$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX )
   shopt -u nullglob
   (( ${#files[@]} == 0 )) && continue
 
-  # local GPX
+  # local GPX first
   if (( ${#loc[@]} > 0 )); then
     if [[ "$RETAG_MODE" == "missing" ]]; then
       xt "-geosync=${geo_shift}" -geotag "$dir" -if 'not $gpslatitude' "${files[@]}"
@@ -174,7 +172,6 @@ while IFS= read -r -d '' dir; do
   fi
 
   # pool GPX
-  shopt -s nullglob; pool=( "$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX ); shopt -u nullglob
   if (( ${#pool[@]} > 0 )); then
     before=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "${files[@]}" | wc -l | tr -d ' ')
     for g in "${pool[@]}"; do
@@ -188,7 +185,8 @@ while IFS= read -r -d '' dir; do
       if (( updated > 0 )); then
         echo "  [+] $(basename "$g") -> $dir  (updated $updated)"
         if (( COPY_MATCHED==1 )); then
-          dst="$dir/$(basename "$g")"; if [[ -e "$dst" ]]; then n=1; while [[ -e "${dst%.*}_$n.${dst##*.}" ]]; do n=$((n+1)); done; dst="${dst%.*}_$n.${dst##*.}"; fi
+          dst="$dir/$(basename "$g")"
+          if [[ -e "$dst" ]]; then n=1; while [[ -e "${dst%.*}_$n.${dst##*.}" ]]; do n=$((n+1)); done; dst="${dst%.*}_$n.${dst##*.}"; fi
           cp -n "$g" "$dst" || true
         fi
         before=$after

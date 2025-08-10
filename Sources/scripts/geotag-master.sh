@@ -197,40 +197,42 @@ show_after(){
     "$dir" | head -n $VERBOSE_SAMPLE_COUNT
 }
 
-# -------------------- Phase A: time normalization --------------------
+# -------------------- Phase A: time normalization (NON-RECURSIVE per folder) --------------------
 if [[ $WRITE_TIME -eq 1 ]]; then
-  echo "Phase A: rewriting EXIF times..."
-  if [[ $NET_DELTA -ne 0 ]]; then
-    abs_sec=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
-    abs_hms=$(secs_to_hms $abs_sec); abs_hms="${abs_hms#?}"
-    [[ $VERBOSE -eq 1 ]] && echo "[INFO] shifting AllDates by $([[ $NET_DELTA -gt 0 ]] && echo + || echo -)$abs_hms"
-    if [[ $NET_DELTA -gt 0 ]]; then
-      run "-AllDates+=${abs_hms}" -r "$PHOTOS_ROOT"
-    else
-      run "-AllDates-=${abs_hms}" -r "$PHOTOS_ROOT"
-    fi
-    if [[ $ALSO_QT -eq 1 ]]; then
+  echo "Phase A: rewriting EXIF times (per folder)..."
+  while IFS= read -r -d '' dir; do
+    if [[ $NET_DELTA -ne 0 ]]; then
+      abs_sec=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
+      abs_hms=$(secs_to_hms $abs_sec); abs_hms="${abs_hms#?}"
+      [[ $VERBOSE -eq 1 ]] && echo "[INFO] $dir  shift AllDates by $([[ $NET_DELTA -gt 0 ]] && echo + || echo -)$abs_hms"
       if [[ $NET_DELTA -gt 0 ]]; then
-        run "-QuickTime:CreateDate+=${abs_hms}" "-QuickTime:ModifyDate+=${abs_hms}" \
-            "-QuickTime:MediaCreateDate+=${abs_hms}" "-XMP:CreateDate+=${abs_hms}" \
-            -r "$PHOTOS_ROOT"
+        run "-AllDates+=${abs_hms}" "$dir"
       else
-        run "-QuickTime:CreateDate-=${abs_hms}" "-QuickTime:ModifyDate-=${abs_hms}" \
-            "-QuickTime:MediaCreateDate-=${abs_hms}" "-XMP:CreateDate-=${abs_hms}" \
-            -r "$PHOTOS_ROOT"
+        run "-AllDates-=${abs_hms}" "$dir"
+      fi
+      if [[ $ALSO_QT -eq 1 ]]; then
+        if [[ $NET_DELTA -gt 0 ]]; then
+          run "-QuickTime:CreateDate+=${abs_hms}" "-QuickTime:ModifyDate+=${abs_hms}" \
+              "-QuickTime:MediaCreateDate+=${abs_hms}" "-XMP:CreateDate+=${abs_hms}" \
+              "$dir"
+        else
+          run "-QuickTime:CreateDate-=${abs_hms}" "-QuickTime:ModifyDate-=${abs_hms}" \
+              "-QuickTime:MediaCreateDate-=${abs_hms}" "-XMP:CreateDate-=${abs_hms}" \
+              "$dir"
+        fi
       fi
     fi
-  fi
-  if [[ $WRITE_TZ_TAGS -eq 1 ]]; then
-    to_abs=$TO_OFFS; to_sign="+"; [[ $to_abs -lt 0 ]] && to_sign="-" && to_abs=$(( -to_abs ))
-    to_h=$(printf "%02d" $(( to_abs/3600 ))); to_m=$(printf "%02d" $(( (to_abs%3600)/60 )))
-    tzstr="${to_sign}${to_h}:${to_m}"
-    [[ $VERBOSE -eq 1 ]] && echo "[INFO] writing OffsetTime* = $tzstr"
-    run "-OffsetTimeOriginal=$tzstr" "-OffsetTime=$tzstr" "-OffsetTimeDigitized=$tzstr" -r "$PHOTOS_ROOT"
-  fi
+    if [[ $WRITE_TZ_TAGS -eq 1 ]]; then
+      to_abs=$TO_OFFS; to_sign="+"; [[ $to_abs -lt 0 ]] && to_sign="-" && to_abs=$(( -to_abs ))
+      to_h=$(printf "%02d" $(( to_abs/3600 ))); to_m=$(printf "%02d" $(( (to_abs%3600)/60 )))
+      tzstr="${to_sign}${to_h}:${to_m}"
+      [[ $VERBOSE -eq 1 ]] && echo "[INFO] $dir  write OffsetTime* = $tzstr"
+      run "-OffsetTimeOriginal=$tzstr" "-OffsetTime=$tzstr" "-OffsetTimeDigitized=$tzstr" "$dir"
+    fi
+  done < <(find "$PHOTOS_ROOT" -type d -print0)
 fi
 
-# -------------------- Phase B: geotagging --------------------
+# -------------------- Phase B: geotagging (NON-RECURSIVE per folder) --------------------
 echo "Phase B: geotagging per folder..."
 while IFS= read -r -d '' dir; do
   shopt -s nullglob

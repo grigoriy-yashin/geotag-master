@@ -63,7 +63,7 @@ trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space
 parse_tz_to_seconds(){
   local z; z="$(trim "$1")"
   if [[ "$z" == "Z" || "$z" == "UTC" || "$z" == "utc" ]]; then echo 0; return; fi
-  if [[ "$z" =~ ^UTC([+-].+)$ ]]; then z="${BASHREMATCH[1]}"; fi
+  if [[ "$z" =~ ^UTC([+-].+)$ ]]; then z="${BASH_REMATCH[1]}"; fi
   if [[ "$z" =~ ^([+-])([0-9]{1,2})$ ]]; then
     local sgn="${BASH_REMATCH[1]}" hh="${BASH_REMATCH[2]}"; ((10#$hh<=14)) || die "TZ hour $z"
     local secs=$((10#$hh*3600)); [[ $sgn == "-" ]] && secs=$((-secs)); echo "$secs"; return

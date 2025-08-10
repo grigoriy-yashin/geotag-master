@@ -25,6 +25,7 @@ DRYRUN=0
 VERBOSE=0
 
 VERBOSE_SAMPLE_COUNT=3
+CHUNK_SIZE=200        # max files per exiftool invocation
 
 # -------------------- Help --------------------
 die(){ echo "Error: $*" >&2; exit 1; }
@@ -139,6 +140,30 @@ run(){
   exiftool "${common[@]}" "$@"
 }
 
+# List photo files in a dir (non-recursive), return array via nameref
+list_photo_files() {
+  local dir="$1"; local -n out="$2"
+  out=()
+  while IFS= read -r -d '' f; do out+=("$f"); done < <(
+    find "$dir" -maxdepth 1 -type f \
+      \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.orf' -o -iname '*.rw2' -o -iname '*.arw' -o -iname '*.cr2' -o -iname '*.dng' -o -iname '*.nef' -o -iname '*.heic' -o -iname '*.heif' -o -iname '*.tif' -o -iname '*.tiff' \) -print0
+  )
+}
+
+# Run exiftool on file list in chunks
+run_on_files() {
+  local -n files="$1"; shift
+  local n=${#files[@]}
+  (( n == 0 )) && return 0
+  local i=0
+  while (( i < n )); do
+    local end=$(( i + CHUNK_SIZE )); (( end > n )) && end=$n
+    local slice=("${files[@]:i:end-i}")
+    run "$@" "${slice[@]}"
+    i=$end
+  done
+}
+
 # -------------------- Build parameters --------------------
 FROM_OFFS=$(parse_tz_to_seconds "$FROM_TZ")
 TO_OFFS=$(parse_tz_to_seconds "$TO_TZ")
@@ -197,42 +222,42 @@ show_after(){
     "$dir" | head -n $VERBOSE_SAMPLE_COUNT
 }
 
-# -------------------- Phase A: time normalization (NON-RECURSIVE per folder) --------------------
+# -------------------- Phase A: time normalization (per folder, file lists) --------------------
 if [[ $WRITE_TIME -eq 1 ]]; then
   echo "Phase A: rewriting EXIF times (per folder)..."
   while IFS= read -r -d '' dir; do
+    declare -a files=(); list_photo_files "$dir" files
+    (( ${#files[@]} == 0 )) && continue
+
     if [[ $NET_DELTA -ne 0 ]]; then
       abs_sec=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
       abs_hms=$(secs_to_hms $abs_sec); abs_hms="${abs_hms#?}"
       [[ $VERBOSE -eq 1 ]] && echo "[INFO] $dir  shift AllDates by $([[ $NET_DELTA -gt 0 ]] && echo + || echo -)$abs_hms"
       if [[ $NET_DELTA -gt 0 ]]; then
-        run "-AllDates+=${abs_hms}" "$dir"
+        run_on_files files "-AllDates+=${abs_hms}"
       else
-        run "-AllDates-=${abs_hms}" "$dir"
+        run_on_files files "-AllDates-=${abs_hms}"
       fi
       if [[ $ALSO_QT -eq 1 ]]; then
         if [[ $NET_DELTA -gt 0 ]]; then
-          run "-QuickTime:CreateDate+=${abs_hms}" "-QuickTime:ModifyDate+=${abs_hms}" \
-              "-QuickTime:MediaCreateDate+=${abs_hms}" "-XMP:CreateDate+=${abs_hms}" \
-              "$dir"
+          run_on_files files "-QuickTime:CreateDate+=${abs_hms}" "-QuickTime:ModifyDate+=${abs_hms}" "-QuickTime:MediaCreateDate+=${abs_hms}" "-XMP:CreateDate+=${abs_hms}"
         else
-          run "-QuickTime:CreateDate-=${abs_hms}" "-QuickTime:ModifyDate-=${abs_hms}" \
-              "-QuickTime:MediaCreateDate-=${abs_hms}" "-XMP:CreateDate-=${abs_hms}" \
-              "$dir"
+          run_on_files files "-QuickTime:CreateDate-=${abs_hms}" "-QuickTime:ModifyDate-=${abs_hms}" "-QuickTime:MediaCreateDate-=${abs_hms}" "-XMP:CreateDate-=${abs_hms}"
         fi
       fi
     fi
+
     if [[ $WRITE_TZ_TAGS -eq 1 ]]; then
       to_abs=$TO_OFFS; to_sign="+"; [[ $to_abs -lt 0 ]] && to_sign="-" && to_abs=$(( -to_abs ))
       to_h=$(printf "%02d" $(( to_abs/3600 ))); to_m=$(printf "%02d" $(( (to_abs%3600)/60 )))
       tzstr="${to_sign}${to_h}:${to_m}"
       [[ $VERBOSE -eq 1 ]] && echo "[INFO] $dir  write OffsetTime* = $tzstr"
-      run "-OffsetTimeOriginal=$tzstr" "-OffsetTime=$tzstr" "-OffsetTimeDigitized=$tzstr" "$dir"
+      run_on_files files "-OffsetTimeOriginal=$tzstr" "-OffsetTime=$tzstr" "-OffsetTimeDigitized=$tzstr"
     fi
   done < <(find "$PHOTOS_ROOT" -type d -print0)
 fi
 
-# -------------------- Phase B: geotagging (NON-RECURSIVE per folder) --------------------
+# -------------------- Phase B: geotagging (per folder, file lists) --------------------
 echo "Phase B: geotagging per folder..."
 while IFS= read -r -d '' dir; do
   shopt -s nullglob
@@ -241,23 +266,32 @@ while IFS= read -r -d '' dir; do
 
   [[ $VERBOSE -eq 1 ]] && show_samples "$dir"
 
+  declare -a files=(); list_photo_files "$dir" files
+  (( ${#files[@]} == 0 )) && { [[ $VERBOSE -eq 1 ]] && echo "[INFO] $dir  (no photo files)"; continue; }
+
+  # Pass 1: local GPX only
   if [[ ${#gpx_here[@]} -gt 0 ]]; then
     if [[ "$RETAG_MODE" == "missing" ]]; then
-      run "${geo_args[@]}" -geotag "$dir" -if 'not $gpslatitude' "$dir"
+      run "${geo_args[@]}" -geotag "$dir" -if 'not $gpslatitude' "${files[@]}"
     else
-      run "${geo_args[@]}" -geotag "$dir" "$dir"
+      run "${geo_args[@]}" -geotag "$dir" "${files[@]}"
     fi
   fi
 
-  missing_before=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
+  # Pass 2: pool GPX for remaining files without GPS
+  missing_before=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "${files[@]}" | wc -l | tr -d ' ')
   if [[ "$missing_before" -gt 0 ]]; then
     shopt -s nullglob
     pool_gpx=("$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX)
     shopt -u nullglob
     if [[ ${#pool_gpx[@]} -gt 0 ]]; then
       for gpx in "${pool_gpx[@]}"; do
-        run "${geo_args[@]}" -geotag "$gpx" -if 'not $gpslatitude' "$dir"
-        missing_after=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
+        if [[ "$RETAG_MODE" == "missing" ]]; then
+          run "${geo_args[@]}" -geotag "$gpx" -if 'not $gpslatitude' "${files[@]}"
+        else
+          run "${geo_args[@]}" -geotag "$gpx" "${files[@]}"
+        fi
+        missing_after=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "${files[@]}" | wc -l | tr -d ' ')
         updated=$(( missing_before - missing_after ))
         if [[ $updated -gt 0 ]]; then
           echo "  [+] $(basename "$gpx") matched $dir  (updated $updated files)"

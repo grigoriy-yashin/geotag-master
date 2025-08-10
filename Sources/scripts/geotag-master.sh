@@ -164,7 +164,7 @@ if [[ -n "$SHIFT_EXPLICIT" ]]; then
 else
   # compute from FROM/TO and drift
   if [[ -n "$FROM_TZ" && -n "$TO_TZ" ]]; then
-    local from_s to_s drift_s=0
+    declare from_s to_s drift_s=0
     from_s=$(parse_tz_to_seconds "$FROM_TZ")
     to_s=$(parse_tz_to_seconds "$TO_TZ")
     case "$DRIFT_KIND" in
@@ -210,7 +210,7 @@ GEOTAG_TZ=""
 if [[ -n "$TO_TZ" ]]; then
   # normalize to ±HH:MM string
   to_s=$(parse_tz_to_seconds "$TO_TZ")
-  local sign="+"; [[ $to_s -lt 0 ]] && sign="-" && to_s=$((-to_s))
+  declare sign="+"; [[ $to_s -lt 0 ]] && sign="-" && to_s=$((-to_s))
   GEOTAG_TZ=$(printf "%s%02d:%02d" "$sign" $((to_s/3600)) $(((to_s%3600)/60)))
 elif [[ -n "$TZ_TAG" ]]; then
   GEOTAG_TZ="$TZ_TAG"

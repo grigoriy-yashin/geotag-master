@@ -22,10 +22,11 @@ OVERWRITE=0           # 1 = no _original backups
 COPY_MATCHED=0        # 1 = copy matched pool GPX into each folder it tags
 RETAG_MODE="missing"  # missing|overwrite (default: only fill missing GPS)
 DRYRUN=0              # 1 = print, don't execute
-VERBOSE=0             # 1 = print detailed steps and before/after samples
+VERBOSE=0             # 1 = detailed logging
 
-# Tuning
-EXTS=(jpg jpeg orf rw2 arw cr2 dng nef heic heif tif tiff)
+# Extensions (lower + UPPER to be safe on Linux)
+EXTS=(jpg JPG jpeg JPEG orf ORF rw2 RW2 arw ARW cr2 CR2 dng DNG nef NEF heic HEIC heif HEIF tif TIF tiff TIFF)
+
 VERBOSE_SAMPLE_COUNT=3
 
 # -------------------- Help --------------------
@@ -36,38 +37,26 @@ cat <<'USAGE'
 Usage:
   geotag-master.sh --photos PATH --pool PATH --from-tz ZONE --to-tz ZONE [options]
 
-Meaning:
-  --from-tz   Time zone your CAMERA CLOCK showed at shooting time
-  --to-tz     ACTUAL local time zone you want in EXIF (what iNaturalist should show)
-
-Time zone formats for --from-tz / --to-tz:
+--from-tz / --to-tz formats:
   • IANA zone:  Europe/Moscow, Asia/Almaty, America/New_York
-    (Uses that zone's CURRENT offset at run time; DST isn't inferred per photo.)
   • Numeric:    UTC+6, UTC-3:30, +6, -04:00, Z, UTC
-    (Fixed offsets; recommended for predictability.)
 
-Optional drift (no +/- thinking):
+Drift (no +/- thinking):
   --drift-ahead  2m      # camera runs 2 minutes fast
   --drift-behind 30s     # camera runs 30 seconds slow
-  --drift-exact  +75s    # explicit signed shift if you truly want to specify a sign
+  --drift-exact  +75s    # explicit signed shift
 
 Time normalization:
-  --write-time           # rewrite EXIF capture times to TO_TZ (AllDates)
-  --write-tz-tags        # write OffsetTimeOriginal/OffsetTime/OffsetTimeDigitized (+06:00 etc.)
-  --also-qt              # also adjust QuickTime/HEIC times and XMP:CreateDate (HEIC/MP4/Live Photos)
+  --write-time           # shift EXIF capture times (AllDates) to TO_TZ
+  --write-tz-tags        # write OffsetTimeOriginal/OffsetTime/OffsetTimeDigitized
+  --also-qt              # also adjust QuickTime/HEIC/XMP time tags
 
 Behavior:
-  --copy-matched         # copy each pool GPX that successfully tagged files into that folder
-  --retag overwrite      # allow overwriting existing GPS (default: only fill missing GPS)
-  --overwrite            # do not keep _original backups
-  --dry-run              # print actions only (no changes)
-  --verbose              # detailed logging; show before/after samples
-  -h, --help             # show this help
-
-Example (camera showed Moscow, actual Astana, camera +2 min fast):
-  ./geotag-master.sh --photos /data/photos --pool /data/gpx \
-    --from-tz UTC+3 --to-tz UTC+6 --drift-ahead 2m \
-    --write-time --write-tz-tags --copy-matched --verbose
+  --copy-matched         # copy each matching pool GPX into that folder
+  --retag overwrite      # replace existing GPS (default: only fill missing)
+  --overwrite            # no _original backups
+  --dry-run              # print commands only
+  --verbose              # detailed logs + before/after samples
 USAGE
 }
 
@@ -86,9 +75,8 @@ while [[ $# -gt 0 ]]; do
     --also-qt) ALSO_QT=1; shift;;
     --overwrite) OVERWRITE=1; shift;;
     --copy-matched) COPY_MATCHED=1; shift;;
-    --retag)
-      [[ "${2:-}" =~ ^(missing|overwrite)$ ]] || die "--retag must be 'missing' or 'overwrite'"
-      RETAG_MODE="$2"; shift 2;;
+    --retag) [[ "${2:-}" =~ ^(missing|overwrite)$ ]] || die "--retag must be missing|overwrite"
+             RETAG_MODE="$2"; shift 2;;
     --dry-run) DRYRUN=1; shift;;
     --verbose) VERBOSE=1; shift;;
     -h|--help) usage; exit 0;;
@@ -104,19 +92,29 @@ done
 # -------------------- Helpers --------------------
 trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
 
+# Parse TZ to seconds from UTC.
+# Supports: Z, UTC, UTC+5, UTC-3:30, +06, -04:00, and IANA names.
 parse_tz_to_seconds() {
   local z; z="$(trim "$1")"
   if [[ "$z" == "Z" || "$z" == "UTC" || "$z" == "utc" ]]; then echo 0; return; fi
   if [[ "$z" =~ ^UTC([+-].+)$ ]]; then z="${BASH_REMATCH[1]}"; fi
-  if [[ "$z" =~ ^([+-])([0-9]{1,2})(?::?([0-9]{2}))?$ ]]; then
-    local sign="${BASH_REMATCH[1]}" hh="${BASH_REMATCH[2]}" mm="${BASH_REMATCH[3]:-00}"
+  # numeric: +H, -HH, +HH:MM
+  if [[ "$z" =~ ^([+-])([0-9]{1,2})$ ]]; then
+    local sign="${BASH_REMATCH[1]}" hh="${BASH_REMATCH[2]}" mm="00"
+    (( 10#$hh <= 14 )) || die "Hour out of range in TZ offset: $z"
+    local secs=$((10#$hh*3600)); [[ "$sign" == "-" ]] && secs=$((-secs))
+    echo "$secs"; return
+  elif [[ "$z" =~ ^([+-])([0-9]{1,2}):([0-9]{2})$ ]]; then
+    local sign="${BASH_REMATCH[1]}" hh="${BASH_REMATCH[2]}" mm="${BASH_REMATCH[3]}"
     (( 10#$hh <= 14 )) || die "Hour out of range in TZ offset: $z"
     (( 10#$mm <= 59 )) || die "Minute out of range in TZ offset: $z"
     local secs=$((10#$hh*3600 + 10#$mm*60)); [[ "$sign" == "-" ]] && secs=$((-secs))
     echo "$secs"; return
   fi
+  # IANA fallback
   TZ="$z" date +%z >/dev/null 2>&1 || die "Unknown time zone: $z"
-  local s; s="$(TZ="$z" date +%z)"; local sign="${s:0:1}" hh="${s:1:2}" mm="${s:3:2}"
+  local s; s="$(TZ="$z" date +%z)"  # e.g. +0600
+  local sign="${s:0:1}" hh="${s:1:2}" mm="${s:3:2}"
   local secs=$((10#$hh*3600 + 10#$mm*60)); [[ "$sign" == "-" ]] && secs=$((-secs))
   echo "$secs"
 }
@@ -127,6 +125,7 @@ secs_to_hms(){
   printf "%s%d:%d:%d" "$sign" "$h" "$m" "$sc"
 }
 
+# Drift parsing
 parse_drift_value_abs() {
   local v="$1"
   if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 + ${BASH_REMATCH[2]} ))
@@ -192,7 +191,7 @@ echo "Geotag syncs  : ${GEO_SYNC_LIST[*]}"
 echo "Rewrite times : $([[ $WRITE_TIME -eq 1 ]] && echo YES || echo NO)   (net $(fmt_offs $NET_DELTA))"
 echo "Write TZ tags : $([[ $WRITE_TZ_TAGS -eq 1 ]] && echo YES || echo NO)"
 echo "Also QuickTime: $([[ $ALSO_QT -eq 1 ]] && echo YES || echo NO)"
-echo "Retag mode    : $RETAG_MODE"
+echo "Retag mode    : $[[ $RETAG_MODE == overwrite ]] && echo overwrite || echo missing"
 echo "Copy matched  : $([[ $COPY_MATCHED -eq 1 ]] && echo YES || echo NO)"
 echo "Overwrite     : $([[ $OVERWRITE -eq 1 ]] && echo YES || echo NO)"
 echo "Dry run       : $([[ $DRYRUN -eq 1 ]] && echo YES || echo NO)"

@@ -14,17 +14,19 @@ TO_TZ=""              # actual local time you want in EXIF/iNat, e.g. UTC+6 or A
 DRIFT_KIND=""         # ahead|behind|exact
 DRIFT_VAL=""          # e.g. 2m, 1:30m, 45s (no sign for ahead/behind; exact may include sign)
 
-WRITE_TIME=0          # rewrite EXIF times (DateTimeOriginal/CreateDate/ModifyDate) to TO_TZ
+WRITE_TIME=0          # rewrite EXIF times (AllDates) to TO_TZ
 WRITE_TZ_TAGS=0       # write OffsetTime* tags to match TO_TZ (e.g. +06:00)
+ALSO_QT=0             # also shift QuickTime/HEIC times (CreateDate/MediaCreateDate) and XMP:CreateDate
 
 OVERWRITE=0           # 1 = no _original backups
 COPY_MATCHED=0        # 1 = copy matched pool GPX into each folder it tags
 RETAG_MODE="missing"  # missing|overwrite (default: only fill missing GPS)
 DRYRUN=0              # 1 = print, don't execute
+VERBOSE=0             # 1 = print detailed steps and before/after samples
 
 # Tuning
 EXTS=(jpg jpeg orf rw2 arw cr2 dng nef heic heif tif tiff)
-GEOMAX_INT_SECS=900   # interpolation window (seconds) for GPX matching; increase if needed
+VERBOSE_SAMPLE_COUNT=3
 
 # -------------------- Help --------------------
 die(){ echo "Error: $*" >&2; exit 1; }
@@ -49,21 +51,23 @@ Optional drift (no +/- thinking):
   --drift-behind 30s     # camera runs 30 seconds slow
   --drift-exact  +75s    # explicit signed shift if you truly want to specify a sign
 
-iNaturalist-friendly normalization:
-  --write-time           # rewrite EXIF capture times to TO_TZ
+Time normalization:
+  --write-time           # rewrite EXIF capture times to TO_TZ (AllDates)
   --write-tz-tags        # write OffsetTimeOriginal/OffsetTime/OffsetTimeDigitized (+06:00 etc.)
+  --also-qt              # also adjust QuickTime/HEIC times and XMP:CreateDate (HEIC/MP4/Live Photos)
 
 Behavior:
-  --copy-matched         # copy a pool GPX into each folder it successfully tags
+  --copy-matched         # copy each pool GPX that successfully tagged files into that folder
   --retag overwrite      # allow overwriting existing GPS (default: only fill missing GPS)
   --overwrite            # do not keep _original backups
   --dry-run              # print actions only (no changes)
+  --verbose              # detailed logging; show before/after samples
   -h, --help             # show this help
 
 Example (camera showed Moscow, actual Astana, camera +2 min fast):
   ./geotag-master.sh --photos /data/photos --pool /data/gpx \
     --from-tz UTC+3 --to-tz UTC+6 --drift-ahead 2m \
-    --write-time --write-tz-tags --copy-matched
+    --write-time --write-tz-tags --copy-matched --verbose
 USAGE
 }
 
@@ -79,12 +83,14 @@ while [[ $# -gt 0 ]]; do
     --drift-exact)  DRIFT_KIND="exact";  DRIFT_VAL="${2:-}"; shift 2;;
     --write-time) WRITE_TIME=1; shift;;
     --write-tz-tags) WRITE_TZ_TAGS=1; shift;;
+    --also-qt) ALSO_QT=1; shift;;
     --overwrite) OVERWRITE=1; shift;;
     --copy-matched) COPY_MATCHED=1; shift;;
     --retag)
       [[ "${2:-}" =~ ^(missing|overwrite)$ ]] || die "--retag must be 'missing' or 'overwrite'"
       RETAG_MODE="$2"; shift 2;;
     --dry-run) DRYRUN=1; shift;;
+    --verbose) VERBOSE=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown argument: $1";;
   esac
@@ -98,8 +104,6 @@ done
 # -------------------- Helpers --------------------
 trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
 
-# Parse TZ as IANA or numeric offset; return seconds from UTC.
-# Supported numeric: Z, UTC, UTC+5, UTC-3:30, +06, -04:00
 parse_tz_to_seconds() {
   local z; z="$(trim "$1")"
   if [[ "$z" == "Z" || "$z" == "UTC" || "$z" == "utc" ]]; then echo 0; return; fi
@@ -123,7 +127,6 @@ secs_to_hms(){
   printf "%s%d:%d:%d" "$sign" "$h" "$m" "$sc"
 }
 
-# Parse drift like 2m, 1:30m, 45s, +75s
 parse_drift_value_abs() {
   local v="$1"
   if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 + ${BASH_REMATCH[2]} ))
@@ -137,15 +140,19 @@ parse_drift_exact_signed() {
   local abs; abs="$(parse_drift_value_abs "$v")"; [[ "$sign" == "-" ]] && echo $((-abs)) || echo "$abs"
 }
 
+log(){ [[ $VERBOSE -eq 1 ]] && echo "$@" >&2 || true; }
+
+# exiftool runner
+common=(-P); [[ $OVERWRITE -eq 1 ]] && common+=(-overwrite_original)
 run(){
-  if [[ $DRYRUN -eq 1 ]]; then
-    printf "[DRY] exiftool"
+  if [[ $DRYRUN -eq 1 || $VERBOSE -eq 1 ]]; then
+    printf "[CMD] exiftool"
     for a in "${common[@]}"; do printf " %q" "$a"; done
     while [[ $# -gt 0 ]]; do printf " %q" "$1"; shift; done
     printf "\n"
-  else
-    exiftool "${common[@]}" "$@"
+    [[ $DRYRUN -eq 1 ]] && return 0
   fi
+  exiftool "${common[@]}" "$@"
 }
 
 # -------------------- Build parameters --------------------
@@ -156,8 +163,8 @@ TO_OFFS=$(parse_tz_to_seconds "$TO_TZ")
 DRIFT_SECS=0
 if [[ -n "$DRIFT_KIND" && -n "$DRIFT_VAL" ]]; then
   case "$DRIFT_KIND" in
-    ahead)   DRIFT_SECS=$(parse_drift_value_abs "$DRIFT_VAL") ;;   # +seconds
-    behind)  DRIFT_SECS=$(( - $(parse_drift_value_abs "$DRIFT_VAL") )) ;; # -seconds
+    ahead)   DRIFT_SECS=$(parse_drift_value_abs "$DRIFT_VAL") ;;
+    behind)  DRIFT_SECS=$(( - $(parse_drift_value_abs "$DRIFT_VAL") )) ;;
     exact)   DRIFT_SECS=$(parse_drift_exact_signed "$DRIFT_VAL") ;;
     *) die "Invalid DRIFT_KIND '$DRIFT_KIND'";;
   esac
@@ -166,15 +173,12 @@ fi
 # Geotag sync: shift GPX (UTC) into camera wall-clock (FROM_TZ), then add drift
 GEO_SYNC_LIST=( "0:0:0 $(secs_to_hms $FROM_OFFS)" )
 [[ $DRIFT_SECS -ne 0 ]] && GEO_SYNC_LIST+=( "0:0:0 $(secs_to_hms $DRIFT_SECS)" )
+geo_args=(); for s in "${GEO_SYNC_LIST[@]}"; do geo_args+=(-geosync "$s"); done
 
 # If rewriting EXIF times: move camera wall-time to actual local (TO_TZ) + drift correction
 NET_DELTA=$(( TO_OFFS - FROM_OFFS + DRIFT_SECS ))
 
-# ExifTool common args
-common=(-P) # preserve file modtimes
-[[ $OVERWRITE -eq 1 ]] && common+=(-overwrite_original)
-
-# -ext args (used when recursing for EXIF time rewrite)
+# -ext args for recursive passes
 ext_args=(); for e in "${EXTS[@]}"; do ext_args+=(-ext "$e"); done
 
 # -------------------- Summary --------------------
@@ -183,94 +187,121 @@ echo "Photos root   : $PHOTOS_ROOT"
 echo "GPX pool      : $GPX_POOL"
 echo "Camera TZ     : $FROM_TZ (offset $(fmt_offs $FROM_OFFS))"
 echo "Actual TZ     : $TO_TZ   (offset $(fmt_offs $TO_OFFS))"
-if [[ -n "$DRIFT_KIND" ]]; then
-  echo "Camera drift  : $DRIFT_KIND $DRIFT_VAL  => $(fmt_offs $DRIFT_SECS)"
-else
-  echo "Camera drift  : none"
-fi
+[[ -n "$DRIFT_KIND" ]] && echo "Camera drift  : $DRIFT_KIND $DRIFT_VAL  => $(fmt_offs $DRIFT_SECS)" || echo "Camera drift  : none"
 echo "Geotag syncs  : ${GEO_SYNC_LIST[*]}"
 echo "Rewrite times : $([[ $WRITE_TIME -eq 1 ]] && echo YES || echo NO)   (net $(fmt_offs $NET_DELTA))"
 echo "Write TZ tags : $([[ $WRITE_TZ_TAGS -eq 1 ]] && echo YES || echo NO)"
+echo "Also QuickTime: $([[ $ALSO_QT -eq 1 ]] && echo YES || echo NO)"
 echo "Retag mode    : $RETAG_MODE"
 echo "Copy matched  : $([[ $COPY_MATCHED -eq 1 ]] && echo YES || echo NO)"
 echo "Overwrite     : $([[ $OVERWRITE -eq 1 ]] && echo YES || echo NO)"
 echo "Dry run       : $([[ $DRYRUN -eq 1 ]] && echo YES || echo NO)"
+echo "Verbose       : $([[ $VERBOSE -eq 1 ]] && echo YES || echo NO)"
 echo
+
+# -------------------- Verbose: before/after samples --------------------
+show_samples(){
+  local dir="$1"
+  [[ $VERBOSE -eq 1 ]] || return 0
+  echo "[BEFORE] sample from: $dir"
+  exiftool -q -q -n -S -G1 \
+    -DateTimeOriginal -CreateDate -ModifyDate \
+    -OffsetTimeOriginal -GPSLatitude -GPSLongitude \
+    "$dir" | head -n $VERBOSE_SAMPLE_COUNT
+}
+show_after(){
+  local dir="$1"
+  [[ $VERBOSE -eq 1 ]] || return 0
+  echo "[AFTER]  sample from: $dir"
+  exiftool -q -q -n -S -G1 \
+    -DateTimeOriginal -CreateDate -ModifyDate \
+    -OffsetTimeOriginal -GPSLatitude -GPSLongitude \
+    "$dir" | head -n $VERBOSE_SAMPLE_COUNT
+}
 
 # -------------------- Optionally rewrite EXIF times --------------------
 if [[ $WRITE_TIME -eq 1 ]]; then
+  echo "Phase A: rewriting EXIF times..."
   if [[ $NET_DELTA -ne 0 ]]; then
     abs_sec=$(( NET_DELTA<0 ? -NET_DELTA : NET_DELTA ))
     abs_hms=$(secs_to_hms $abs_sec); abs_hms="${abs_hms#?}"  # strip sign
+    [[ $VERBOSE -eq 1 ]] && echo "[INFO] shifting AllDates by $([[ $NET_DELTA -gt 0 ]] && echo + || echo -)$abs_hms"
     if [[ $NET_DELTA -gt 0 ]]; then
       run "-AllDates+=${abs_hms}" -r "${ext_args[@]}" "$PHOTOS_ROOT"
     else
       run "-AllDates-=${abs_hms}" -r "${ext_args[@]}" "$PHOTOS_ROOT"
+    fi
+    if [[ $ALSO_QT -eq 1 ]]; then
+      if [[ $NET_DELTA -gt 0 ]]; then
+        run "-QuickTime:CreateDate+=${abs_hms}" "-QuickTime:ModifyDate+=${abs_hms}" \
+            "-QuickTime:MediaCreateDate+=${abs_hms}" "-XMP:CreateDate+=${abs_hms}" \
+            -r "${ext_args[@]}" "$PHOTOS_ROOT"
+      else
+        run "-QuickTime:CreateDate-=${abs_hms}" "-QuickTime:ModifyDate-=${abs_hms}" \
+            "-QuickTime:MediaCreateDate-=${abs_hms}" "-XMP:CreateDate-=${abs_hms}" \
+            -r "${ext_args[@]}" "$PHOTOS_ROOT"
+      fi
     fi
   fi
   if [[ $WRITE_TZ_TAGS -eq 1 ]]; then
     to_abs=$TO_OFFS; to_sign="+"; [[ $to_abs -lt 0 ]] && to_sign="-" && to_abs=$(( -to_abs ))
     to_h=$(printf "%02d" $(( to_abs/3600 ))); to_m=$(printf "%02d" $(( (to_abs%3600)/60 )))
     tzstr="${to_sign}${to_h}:${to_m}"
+    [[ $VERBOSE -eq 1 ]] && echo "[INFO] writing OffsetTime* = $tzstr"
     run "-OffsetTimeOriginal=$tzstr" "-OffsetTime=$tzstr" "-OffsetTimeDigitized=$tzstr" -r "${ext_args[@]}" "$PHOTOS_ROOT"
   fi
 fi
 
 # -------------------- Geotagging --------------------
-# Build geotag args
-geo_args=()
-for s in "${GEO_SYNC_LIST[@]}"; do geo_args+=(-geosync="$s"); done
-geo_args+=(-api GeoMaxIntSecs="$GEOMAX_INT_SECS")
-
-echo "Pass 1: apply folder-local GPX (non-recursive)…"
+echo "Phase B: geotagging per folder..."
 while IFS= read -r -d '' dir; do
   shopt -s nullglob
   gpx_here=("$dir"/*.gpx "$dir"/*.GPX)
   shopt -u nullglob
-  [[ ${#gpx_here[@]} -eq 0 ]] && continue
 
-  if [[ "$RETAG_MODE" == "missing" ]]; then
-    run "${geo_args[@]}" -geotag "$dir" -if 'not $gpslatitude' "$dir"
-  else
-    run "${geo_args[@]}" -geotag "$dir" "$dir"
+  [[ $VERBOSE -eq 1 ]] && show_samples "$dir"
+
+  if [[ ${#gpx_here[@]} -gt 0 ]]; then
+    # Pass 1: local GPX only, non-recursive
+    if [[ "$RETAG_MODE" == "missing" ]]; then
+      run "${geo_args[@]}" -geotag "$dir" -if 'not $gpslatitude' "$dir"
+    else
+      run "${geo_args[@]}" -geotag "$dir" "$dir"
+    fi
   fi
-done < <(find "$PHOTOS_ROOT" -type d -print0)
 
-echo "Pass 2: try pool GPX for folders still missing GPS (non-recursive per folder)…"
-shopt -s nullglob
-pool_gpx=("$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX)
-shopt -u nullglob
-
-if [[ ${#pool_gpx[@]} -gt 0 ]]; then
-  while IFS= read -r -d '' dir; do
-    # skip if folder already has its own GPX
-    shopt -s nullglob; has_local=( "$dir"/*.gpx "$dir"/*.GPX ); shopt -u nullglob
-    [[ ${#has_local[@]} -gt 0 ]] && continue
-
-    # count missing
-    missing_count=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
-    [[ "$missing_count" -eq 0 ]] && continue
-    echo "  > $dir (missing GPS: ~$missing_count)"
-
-    # Try ALL pool GPX until none missing
-    for gpx in "${pool_gpx[@]}"; do
-      out=$(run "${geo_args[@]}" -geotag "$gpx" -if 'not $gpslatitude' "$dir" 2>&1 || true)
-      # Sum "... image files updated/created"
-      updated=$(grep -Eo '[0-9]+ image files (updated|created)' <<<"$out" | awk '{s+=$1} END{print s+0}')
-      if [[ ${updated:-0} -gt 0 ]]; then
-        echo "     matched: $(basename "$gpx")  (+$updated)"
-        if [[ $COPY_MATCHED -eq 1 && $DRYRUN -eq 0 ]]; then
-          cp -n "$gpx" "$dir/" || true
+  # Pass 2: If still missing GPS, try all pool GPX (non-recursive per folder)
+  missing_before=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
+  if [[ "$missing_before" -gt 0 ]]; then
+    shopt -s nullglob
+    pool_gpx=("$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX)
+    shopt -u nullglob
+    if [[ ${#pool_gpx[@]} -gt 0 ]]; then
+      for gpx in "${pool_gpx[@]}"; do
+        run "${geo_args[@]}" -geotag "$gpx" -if 'not $gpslatitude' "$dir"
+        # recompute remaining missing
+        missing_after=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
+        updated=$(( missing_before - missing_after ))
+        if [[ $updated -gt 0 ]]; then
+          echo "  [+] $(basename "$gpx") matched $dir  (updated $updated files)"
+          if [[ $COPY_MATCHED -eq 1 && $DRYRUN -eq 0 ]]; then
+            base="$(basename "$gpx")"; dst="$dir/$base"
+            if [[ -e "$dst" ]]; then
+              n=1; while [[ -e "$dir/${base%.*}_$n.${base##*.}" ]]; do n=$((n+1)); done
+              dst="$dir/${base%.*}_$n.${base##*.}"
+            fi
+            cp -n "$gpx" "$dst" || true
+          fi
         fi
-        # re-count
-        missing_count=$(exiftool -q -q -if 'not $gpslatitude' -T -filename "$dir" | wc -l | tr -d ' ')
-        [[ "$missing_count" -eq 0 ]] && break
-      fi
-    done
-  done < <(find "$PHOTOS_ROOT" -type d -print0)
-else
-  echo "  (No GPX in pool)"
-fi
+        [[ $missing_after -le 0 ]] && break
+        missing_before=$missing_after
+      done
+    fi
+  fi
+
+  [[ $VERBOSE -eq 1 ]] && show_after "$dir"
+
+done < <(find "$PHOTOS_ROOT" -type d -print0)
 
 echo "Done."
 echo "Verify sample:"

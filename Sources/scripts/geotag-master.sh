@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# geotag-master.sh — minimal + robust
-# All exiftool writes go via -@ argfile to avoid quoting issues.
+# geotag-master.sh — normalize times (+TZ) then geotag, using only proven-good exiftool patterns.
+# Phases:
+# 1) Optional time rewrite: NET = (to − from) − ahead + behind (or --shift)
+#    + optional TZ tags (OffsetTime*)
+# 2) Geotag: '-geotime<${DateTimeOriginal}+TZ>' ; apply drift in -geosync ONLY if Phase 1 didn't run
+# Pool GPX is time-prefiltered to avoid random mismatches; matched pool GPX is copied if requested.
 
 PHOTOS_ROOT="."
 GPX_POOL=""
 
 FROM_TZ=""
 TO_TZ=""
-SHIFT_EXPLICIT=""      # ±H:M:S  (overrides FROM/TO/DRIFT math)
-TZ_TAG=""              # ±HH:MM  (writes OffsetTime tags)
+SHIFT_EXPLICIT=""      # ±H:M:S string, e.g. +1:57:0
+TZ_TAG=""              # ±HH:MM, e.g. +05:00
 
 DRIFT_KIND=""          # ahead|behind|exact
-DRIFT_VAL=""
+DRIFT_VAL=""           # e.g. 3m, 45s, 1:30m, +75s
 
 COPY_MATCHED=0
 OVERWRITE=1
 VERBOSE=0
 DRYRUN=0
-MAX_EXT_SECS=0
+MAX_EXT_SECS=0         # seconds to allow beyond ends of GPX (0=off)
 
 die(){ echo "Error: $*" >&2; exit 1; }
 say(){ echo "$*"; }
-cmd(){ [[ $VERBOSE -eq 1 ]] && say "$*"; }
 
 usage(){
   say "Usage:"
@@ -31,13 +34,14 @@ usage(){
   say "     [--from-tz Z --to-tz Z | --shift ±H:M:S] [--drift-ahead V|--drift-behind V|--drift-exact ±S]"
   say "     [--tz-tag ±HH:MM] [--copy-matched] [--no-overwrite] [--max-ext SECS] [--verbose] [--dry-run]"
   say
-  say "Meaning:"
-  say "  Phase 1: shift AllDates by NET = (to − from) − ahead + behind  (or use --shift), then write OffsetTime* if asked."
-  say "  Phase 2: geotag with '-geotime<\${DateTimeOriginal}+TZ>'. If Phase 1 ran, no drift again; else drift via -geosync only."
+  say "Notes:"
+  say "  • NET shift = (to − from) − ahead + behind (or use --shift explicitly)."
+  say "  • --tz-tag only writes OffsetTime*; it does NOT change times."
+  say "  • After Phase 1, drift is NOT re-applied in geotagging."
   exit 1
 }
 
-# ---------- args ----------
+# ---------- arg parse ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --photos) PHOTOS_ROOT="${2:-}"; shift 2;;
@@ -60,8 +64,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -d "$PHOTOS_ROOT" ]] || die "--photos not found"
-if [[ -n "$GPX_POOL" ]]; then [[ -d "$GPX_POOL" ]] || die "--pool not found"; fi
-PHOTOS_ROOT="${PHOTOS_ROOT%/}"; [[ -n "$GPX_POOL" ]] && GPX_POOL="${GPX_POOL%/}"
+PHOTOS_ROOT="${PHOTOS_ROOT%/}"
+if [[ -n "$GPX_POOL" ]]; then
+  [[ -d "$GPX_POOL" ]] || die "--pool not found"
+  GPX_POOL="${GPX_POOL%/}"
+fi
 
 # ---------- helpers ----------
 trim(){ local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; echo "${s%"${s##*[![:space:]]}"}"; }
@@ -82,11 +89,12 @@ parse_tz_to_seconds(){
 }
 
 abs_hms(){ local s=$1; [[ $s -lt 0 ]] && s=$((-s)); printf "%d:%d:%d" $((s/3600)) $(((s%3600)/60)) $((s%60)); }
+
 drift_to_seconds(){
   local v="$1"
-  if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 + ${BASH_REMATCH[2]} ))
-  elif [[ "$v" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]}*60 ))
-  elif [[ "$v" =~ ^([+-]?)([0-9]+)s$ ]]; then echo $(( ${BASH_REMATCH[2]} ))
+  if   [[ "$v" =~ ^([0-9]+):([0-9]{1,2})m$ ]]; then echo $(( ${BASHREMATCH[1]}*60 + ${BASHREMATCH[2]} ))
+  elif [[ "$v" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASHREMATCH[1]}*60 ))
+  elif [[ "$v" =~ ^([+-]?)([0-9]+)s$ ]]; then echo $(( ${BASHREMATCH[2]} ))
   elif [[ "$v" =~ ^([0-9]+)$ ]]; then echo "$v"
   else die "Bad drift '$v' (use 3m, 45s, 1:30m, +75s)"; fi
 }
@@ -95,19 +103,43 @@ drift_exact_seconds(){
   local a; a="$(drift_to_seconds "$v")"; [[ $sgn == "-" ]] && echo $((-a)) || echo "$a"
 }
 
-xt_argfile(){ # -@ runner
+xt_argfile(){ # write opts & files to tmp; run exiftool -@
   local tmp; tmp="$(mktemp)"
   echo "-P" >>"$tmp"
   [[ $OVERWRITE -eq 1 ]] && echo "-overwrite_original" >>"$tmp"
   [[ $MAX_EXT_SECS -gt 0 ]] && echo "-api GeoMaxExtSecs=$MAX_EXT_SECS" >>"$tmp"
-  # options (until --)
   while [[ $# -gt 0 && "$1" != "--" ]]; do printf '%s\n' "$1" >>"$tmp"; shift; done
   [[ "${1:-}" == "--" ]] && shift
-  # files
   while [[ $# -gt 0 ]]; do printf '%s\n' "$1" >>"$tmp"; shift; done
   if [[ $VERBOSE -eq 1 ]]; then echo "[ARGFILE]"; sed 's/^/  /' "$tmp"; fi
   [[ $DRYRUN -eq 1 ]] || exiftool -@ "$tmp"
   rm -f "$tmp"
+}
+
+# parse DateTimeOriginal (+ TZ) to epoch
+dto_to_epoch(){
+  # $1=file, $2=tz like +05:00
+  local dt tz
+  dt="$(exiftool -q -q -n -S -DateTimeOriginal "$1" | awk '{print $2" "$3}')" || return 1
+  tz="$2"
+  [[ -z "$tz" ]] && tz="$(exiftool -q -q -n -S -OffsetTimeOriginal "$1" | awk '/OffsetTimeOriginal/{print $2}')"
+  [[ -z "$tz" ]] && return 1
+  # convert "YYYY:MM:DD HH:MM:SS +05:00" to epoch
+  dt="${dt/:/-}"; dt="${dt/:/-}"                   # YYYY-MM-DD HH:MM:SS
+  date -ud "$dt $tz" +%s 2>/dev/null || return 1
+}
+
+# get GPX first/last time (UTC) as epoch
+gpx_span_epoch(){
+  # $1=gpxfile ; prints "startEpoch endEpoch" or nothing if not found
+  local first last
+  first="$(grep -o '<time>[^<]*</time>' "$1" | head -1 | sed -E 's#</?time>##g')"
+  last="$(grep -o '<time>[^<]*</time>' "$1" | tail -1 | sed -E 's#</?time>##g')"
+  [[ -z "$first" || -z "$last" ]] && return 1
+  local s e
+  s="$(date -ud "$first" +%s 2>/dev/null || true)"; e="$(date -ud "$last" +%s 2>/dev/null || true)"
+  [[ -n "$s" && -n "$e" ]] || return 1
+  echo "$s $e"
 }
 
 # ---------- compute NET shift ----------
@@ -143,21 +175,20 @@ if [[ $APPLIED_SHIFT -eq 1 || -n "$TZ_TAG" || -n "$TO_TZ" ]]; then
             xt_argfile "-DateTimeOriginal-=${NET_SHIFT_STR:1}" "-CreateDate-=${NET_SHIFT_STR:1}" "-ModifyDate-=${NET_SHIFT_STR:1}" -- "$f"
           fi
         fi
-        # Decide TZ tag to write
         if [[ -n "$TZ_TAG" || -n "$TO_TZ" ]]; then
-          tztowrite="$TZ_TAG"
-          if [[ -z "$tztowrite" && -n "$TO_TZ" ]]; then
+          local_tz="$TZ_TAG"
+          if [[ -z "$local_tz" && -n "$TO_TZ" ]]; then
             to_s=$(parse_tz_to_seconds "$TO_TZ"); s="+"; [[ $to_s -lt 0 ]] && s="-" && to_s=$((-to_s))
-            tztowrite=$(printf "%s%02d:%02d" "$s" $((to_s/3600)) $(((to_s%3600)/60)))
+            local_tz=$(printf "%s%02d:%02d" "$s" $((to_s/3600)) $(((to_s%3600)/60)))
           fi
-          [[ "$tztowrite" =~ ^[+-][0-9]{2}:[0-9]{2}$ ]] || die "--tz-tag must be ±HH:MM"
-          xt_argfile "-OffsetTimeOriginal=$tztowrite" "-OffsetTime=$tztowrite" "-OffsetTimeDigitized=$tztowrite" -- "$f"
+          [[ "$local_tz" =~ ^[+-][0-9]{2}:[0-9]{2}$ ]] || die "--tz-tag must be ±HH:MM"
+          xt_argfile "-OffsetTimeOriginal=$local_tz" "-OffsetTime=$local_tz" "-OffsetTimeDigitized=$local_tz" -- "$f"
         fi
       done
   done
 fi
 
-# If we normalized timestamps, we don’t apply drift again in geotag:
+# Decide geotag drift: only if Phase 1 didn't normalize
 GEOSYNC=""
 if [[ $APPLIED_SHIFT -eq 0 && -n "$DRIFT_KIND" ]]; then
   if [[ "$DRIFT_KIND" == "ahead" ]]; then GEOSYNC="+$(abs_hms "$(drift_to_seconds "$DRIFT_VAL")")"
@@ -167,7 +198,7 @@ if [[ $APPLIED_SHIFT -eq 0 && -n "$DRIFT_KIND" ]]; then
   fi
 fi
 
-# Preferred TZ for geotime (from --to-tz or from --tz-tag; else fall back to per-file OffsetTimeOriginal)
+# Preferred TZ for geotime
 GEOTZ=""
 if [[ -n "$TO_TZ" ]]; then
   to_s=$(parse_tz_to_seconds "$TO_TZ"); s="+"; [[ $to_s -lt 0 ]] && s="-" && to_s=$((-to_s))
@@ -179,7 +210,6 @@ fi
 # ---------- Phase 2: geotag ----------
 say "Geotagging..."
 find "$PHOTOS_ROOT" -type d -print0 | while IFS= read -r -d '' dir; do
-  # local & pool GPX
   shopt -s nullglob
   local_gpx=( "$dir"/*.gpx "$dir"/*.GPX )
   pool_gpx=( ); [[ -n "$GPX_POOL" ]] && pool_gpx=( "$GPX_POOL"/*.gpx "$GPX_POOL"/*.GPX )
@@ -187,30 +217,46 @@ find "$PHOTOS_ROOT" -type d -print0 | while IFS= read -r -d '' dir; do
 
   find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.orf' -o -iname '*.rw2' -o -iname '*.arw' -o -iname '*.cr2' -o -iname '*.dng' -o -iname '*.nef' -o -iname '*.heic' -o -iname '*.heif' -o -iname '*.tif' -o -iname '*.tiff' \) -print0 \
   | while IFS= read -r -d '' f; do
-      # decide TZ for this file
+      # TZ for this file at match time:
       tz_for_file="$GEOTZ"
       if [[ -z "$tz_for_file" ]]; then
-        tz_for_file="$(exiftool -q -q -n -S -OffsetTimeOriginal "$f" | awk '/OffsetTimeOriginal/ {print $2}')"
-        if [[ -z "$tz_for_file" ]]; then
-          say "[SKIP] $(basename "$f"): no --to-tz/--tz-tag and no OffsetTimeOriginal"
-          continue
-        fi
+        tz_for_file="$(exiftool -q -q -n -S -OffsetTimeOriginal "$f" | awk '/OffsetTimeOriginal/{print $2}')"
+        [[ -z "$tz_for_file" ]] && { say "[SKIP] $(basename "$f"): no --to-tz/--tz-tag and no OffsetTimeOriginal"; continue; }
       fi
+      # build geotime token (keep ${} for exiftool, not shell)
       geotime="-geotime<\${DateTimeOriginal}${tz_for_file}>"
       geosync_opt=(); [[ -n "$GEOSYNC" ]] && geosync_opt=( "-geosync=$GEOSYNC" )
 
-      # detect whether it had GPS before
+      # Had GPS before?
       before_has_gps=1; exiftool -q -q -n -GPSLatitude "$f" >/dev/null || before_has_gps=0
 
       tagged=0
-      # local GPX first
+
+      # Try local GPX first (no prefilter; local is assumed relevant)
       if (( ${#local_gpx[@]} )); then
         xt_argfile "$geotime" "${geosync_opt[@]}" -geotag "$dir" -- "$f" || true
         exiftool -q -q -n -GPSLatitude "$f" >/dev/null && tagged=1
       fi
-      # pool fallback
+
+      # Pool GPX with time prefilter
       if (( tagged==0 && ${#pool_gpx[@]} )); then
+        # Compute photo UTC epoch
+        photo_epoch=""
+        if pe=$(dto_to_epoch "$f" "$tz_for_file"); then photo_epoch="$pe"; fi
         for g in "${pool_gpx[@]}"; do
+          if [[ -n "$photo_epoch" ]]; then
+            span="$(gpx_span_epoch "$g" || true)"
+            if [[ -n "$span" ]]; then
+              gp_start=$(awk '{print $1}' <<<"$span"); gp_end=$(awk '{print $2}' <<<"$span")
+              # allow MAX_EXT_SECS extension window
+              adj_s=$gp_start; adj_e=$gp_end
+              if (( MAX_EXT_SECS > 0 )); then adj_s=$((gp_start - MAX_EXT_SECS)); adj_e=$((gp_end + MAX_EXT_SECS)); fi
+              if ! (( photo_epoch >= adj_s && photo_epoch <= adj_e )); then
+                [[ $VERBOSE -eq 1 ]] && say "[skip GPX] $(basename "$g") (photo outside ${gp_start}-${gp_end})"
+                continue
+              fi
+            fi
+          fi
           xt_argfile "$geotime" "${geosync_opt[@]}" -geotag "$g" -- "$f" || true
           if exiftool -q -q -n -GPSLatitude "$f" >/dev/null; then
             tagged=1
@@ -223,6 +269,7 @@ find "$PHOTOS_ROOT" -type d -print0 | while IFS= read -r -d '' dir; do
           fi
         done
       fi
+
       if (( VERBOSE==1 )); then
         if (( tagged==1 )); then exiftool -q -q -n -S -GPSLatitude -GPSLongitude "$f" | sed 's/^/[GPS] /'
         else say "[NO MATCH] $(basename "$f")"; fi

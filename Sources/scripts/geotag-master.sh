@@ -68,10 +68,14 @@ tz_to_secs(){
   local z; z="$(trim "$1")"
   [[ "$z" == "UTC" || "$z" == "utc" || "$z" == "Z" ]] && { echo 0; return; }
   [[ "$z" =~ ^UTC([+-].+)$ ]] && z="${BASH_REMATCH[1]}"
-  if [[ "$z" =~ ^([+-])([0-9]{1,2})(?::([0-9]{2}))?$ ]]; then
-    local s="${BASH_REMATCH[1]}" h="${BASH_REMATCH[2]}" m="${BASH_REMATCH[3]:-00}"
-    ((10#$h<=14)) || die "bad TZ hour: $z"; ((10#$m<=59)) || die "bad TZ min: $z"
-    local t=$((10#$h*3600+10#$m*60)); [[ $s == "-" ]] && t=$((-t)); echo "$t"; return
+  if [[ "$z" =~ ^([+-])([0-9]{1,2})(:([0-9]{1,2}))?$ ]]; then
+    local s="${BASH_REMATCH[1]}" h="${BASH_REMATCH[2]}" m="${BASH_REMATCH[4]:-0}"
+    ((10#$h<=14)) || die "bad TZ hour: $z"
+    ((10#$m<=59)) || die "bad TZ min: $z"
+    local t=$((10#$h*3600+10#$m*60))
+    [[ $s == "-" ]] && t=$((-t))
+    echo "$t"
+    return
   fi
   die "unsupported TZ '$1' (use numeric offset)"
 }
